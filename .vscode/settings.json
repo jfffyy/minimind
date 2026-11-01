@@ -1,0 +1,25 @@
+{
+    "python.languageServer": "None",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "basedpyright.disableLanguageServices": false,
+    "basedpyright.analysis.typeCheckingMode": "basic",
+    "basedpyright.analysis.autoImportCompletions": true,
+    "basedpyright.analysis.autoSearchPaths": true,
+    "basedpyright.analysis.useLibraryCodeForTypes": true,
+    "basedpyright.analysis.diagnosticMode": "openFilesOnly",
+    "codingcopilot.enableAutoCompletions": true,
+    "codingcopilot.enableCompletionLanguage": {
+        "python": true
+    },
+    "codingcopilot.generationPreference": "intelligentMode",
+    "codingcopilot.enableNextEditSuggestions": true,
+    "editor.inlineSuggest.enabled": true,
+    "editor.quickSuggestions": {
+        "other": "on",
+        "comments": "off",
+        "strings": "on"
+    },
+    "editor.suggestOnTriggerCharacters": true,
+    "editor.acceptSuggestionOnEnter": "on",
+    "editor.tabCompletion": "off"
+}
