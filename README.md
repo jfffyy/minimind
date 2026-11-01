@@ -1,0 +1,2 @@
+# minimind
+minimind project repository
