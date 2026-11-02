@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: 当前文件（Anaconda GPU）",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "python": "D:\\anaconda\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
