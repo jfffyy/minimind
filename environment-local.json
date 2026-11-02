@@ -1,0 +1,24 @@
+{
+  "verified_date": "2026-11-02",
+  "interpreter": "D:\\anaconda\\python.exe",
+  "python": "3.13.9",
+  "packages": {
+    "torch": "2.12.1+cu132",
+    "transformers": "4.57.6",
+    "numpy": "2.2.0",
+    "pandas": "3.0.3",
+    "tokenizers": "0.22.2",
+    "huggingface-hub": "0.36.2",
+    "safetensors": "0.8.0"
+  },
+  "cuda_build": "13.2",
+  "device": "NVIDIA GeForce RTX 5070 Ti",
+  "checks": {
+    "module_import": "passed",
+    "gpu_rmsnorm_forward_backward": "passed: [2,4,512]",
+    "gpu_projections_rope_kv_repeat_backward": "passed: Q [1,4,8,64], K [1,4,2,64]",
+    "full_attention_forward": "not implemented; remains a learning task"
+  },
+  "pip_check": "Existing sip 6.15.1 requires setuptools>=75.8.1; installed setuptools is 70.2.0. This package pair was not changed.",
+  "runtime": "Use the explicit interpreter or configured VS Code task/debug launcher. The uv lockfile describes the separate uv-managed environment, not this shared Anaconda runtime."
+}

@@ -1,9 +1,11 @@
 import math
-from typing import Optional
+from tkinter import NO
+from typing import Optional,Tuple
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+import torch.nn.functional as F
 
 
 class MiniMindBConfig(PretrainedConfig):
@@ -326,3 +328,50 @@ class Attention(nn.Module):
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
             and args.flash_attention
         )
+
+        def forward (self,x:torch.Tensor,position_embdding :  Tuple[torch.Tensor,torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache: bool = False, 
+        attention_mask: Optional[torch.Tensor] = None ):
+            bsz,seq_len = x.shape
+            xq,xk,xv = self.q_proj(x),self.k_proj(x),self.v_proj(x)
+            xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
+            xk = xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+            xv = xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+            cos,sin = position_embdding
+            xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
+            if past_key_value is not None:
+                xk = torch.cat([past_key_value[0],xk],dim=1)
+                xv = torch.cat([past_key_value[1],xv],dim=1)
+            past_kv = (xk,xv) if use_cache else None
+            xq,xk,xv = (
+                xq.transpose(1,2),
+                repeat_kv(xk,self.n_rep).transpose(1,2),
+                repeat_kv(xv,self.n_rep).transpose(1,2),
+            )
+            if self.flash and seq_len > 1 and (attention_mask is None or 
+            torch.all(attention_mask == 1)) :
+                attn_mask = (
+                        None
+                        if attention_mask is None
+                        else attention_mask.view(bsz,1,1,-1).expand(bsz,self.n_local_heads,seq_len,-1).bool()
+
+                )
+                output = F.scaled_dot_product_attention(xq,xk,xv,attn_mask = attn_mask,dropout_p=self.dropout 
+                if self.training else 0.0,is_causal=True)
+            else:
+                scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
+                scores = scores + torch.triu(
+                    torch.full((seq_len,seq_len),float("-inf"),device=scores.device),diagonal=1
+                ).unsqueeze(0).unsqueeze(0)
+                if attention_mask is not None:
+                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                    scores = scores + extended_attention_mask
+                
+                scores = F.softmax(scores.float(),dim=-1).type_as(xq)
+                scores = self.attn_dropout(scores)
+                output = scores @ xv
+                output = output.transpose(1,2).contiguous().view(bsz,seq_len,-1)
+                output = self.o_proj(output)
+                output = self.resid_dropout(output)
+                return output,past_kv
