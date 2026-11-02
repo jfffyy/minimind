@@ -1,11 +1,12 @@
 import math
-from tkinter import NO
-from typing import Optional,Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 import torch.nn.functional as F
+from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
+
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -329,49 +330,272 @@ class Attention(nn.Module):
             and args.flash_attention
         )
 
-        def forward (self,x:torch.Tensor,position_embdding :  Tuple[torch.Tensor,torch.Tensor],
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache: bool = False, 
-        attention_mask: Optional[torch.Tensor] = None ):
-            bsz,seq_len = x.shape
-            xq,xk,xv = self.q_proj(x),self.k_proj(x),self.v_proj(x)
-            xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
-            xk = xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
-            xv = xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
-            cos,sin = position_embdding
-            xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
-            if past_key_value is not None:
-                xk = torch.cat([past_key_value[0],xk],dim=1)
-                xv = torch.cat([past_key_value[1],xv],dim=1)
-            past_kv = (xk,xv) if use_cache else None
-            xq,xk,xv = (
-                xq.transpose(1,2),
-                repeat_kv(xk,self.n_rep).transpose(1,2),
-                repeat_kv(xv,self.n_rep).transpose(1,2),
-            )
-            if self.flash and seq_len > 1 and (attention_mask is None or 
-            torch.all(attention_mask == 1)) :
-                attn_mask = (
-                        None
-                        if attention_mask is None
-                        else attention_mask.view(bsz,1,1,-1).expand(bsz,self.n_local_heads,seq_len,-1).bool()
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) :
+        """计算因果自注意力，返回当前 token 的输出和可选的 KV 缓存。
 
+        维度记号：
+            B：batch 大小；T：本次输入的 token 数；P：历史缓存中的 token 数。
+            S=P+T：Key/Value 总长度；C：hidden_size；D：单个头的维度。
+            Hq：Q 头数；Hkv：KV 头数。默认 C=512、D=64、Hq=8、Hkv=2。
+
+        参数：
+            x：[B,T,C]，只传本次要计算的 token 的隐藏状态。
+            position_embeddings：(cos, sin)，分别为当前 token 对应的 [T,D]。
+                调用前从整张 RoPE 表选取正确的绝对位置。例如 P=10、T=2，
+                应传 all_cos[10:12]、all_sin[10:12]，而不是再次从位置 0 开始。
+            past_key_value：历史 K、V，均为 [B,P,Hkv,D]；首次计算时为 None。
+                历史 K 已经应用 RoPE，后续只拼接，不再次旋转。
+            use_cache：为 True 时，返回拼接后的 K、V，供下次调用继续使用。
+            attention_mask：[B,S] 的 0/1 掩码，1 表示有效 Key，0 表示 PAD。
+                有历史缓存时，也要包含历史 Key 的有效性标记。
+
+        返回：
+            output：[B,T,C]，与本次输入的形状一致。
+            past_kv：use_cache=True 时为两个 [B,S,Hkv,D] 张量，否则为 None。
+        """
+        # 1. 读取输入形状。x 有三维，因此需要用 _ 接收最后的隐藏维度 C。
+        bsz, seq_len, _ = x.shape
+        past_len = 0 if past_key_value is None else past_key_value[0].shape[1]
+
+        # 2. 用三个独立的线性映射生成 Q、K、V。
+        # Q：[B,T,C] -> [B,T,Hq*D]；K/V：[B,T,C] -> [B,T,Hkv*D]。
+        # 再把最后一维拆为“头数、每头维度”，此时 token 位置仍在第 1 维。
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # 3. 按当前 token 的位置旋转 Q、K，使 QK 点积带上相对位置关系。
+        # 一对分量 (a,b) -> (a*cos-b*sin, b*cos+a*sin)，V 保留投影后的内容。
+        # cos/sin 应已由调用方选好绝对位置；[:seq_len] 取本次需要的 T 行。
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+
+        # 4. 将当前 K/V 接到历史 K/V 后面：[B,P,Hkv,D] + [B,T,Hkv,D]
+        # -> [B,S,Hkv,D]。Q 只保留当前 T 个，因为只需计算当前 token 的输出。
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+
+        # 在重复 KV 头之前保存缓存，每个 token 只存 Hkv 个头，减少缓存占用。
+        # use_cache 控制是否返回新缓存；即使为 False，传入的历史缓存仍会参与计算。
+        past_kv = (xk, xv) if use_cache else None
+
+        # 5. 对齐注意力头数，并把“头”移到“序列”前面，方便每个头独立做矩阵乘法。
+        # repeat_kv：例如 Hkv=2、n_rep=4，头顺序变成 [A,A,A,A,B,B,B,B]。
+        # Q：[B,T,Hq,D] -> [B,Hq,T,D]。
+        # K/V：[B,S,Hkv,D] -> [B,S,Hq,D] -> [B,Hq,S,D]。
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+        kv_len = xk.shape[-2]
+
+        # 6. 无历史缓存、输入含多个 token、没有 PAD 时，使用 SDPA 接口。
+        # 这一分支中 T=S，is_causal=True 正好对应普通的下三角因果掩码。
+        # 全 1 的 padding 掩码与 None 的效果相同，因此无需再传显式 attn_mask。
+        # 缓存使 T 和 S 不同时，转到下面的手动分支，按历史长度正确对齐掩码。
+        if (
+            self.flash
+            and seq_len > 1
+            and past_len == 0
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            # SDPA 合并完成 softmax(QK^T/sqrt(D) + mask) @ V。
+            # 该接口不根据 self.training 自动关闭 Dropout，推理时需显式传 0.0。
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            # 7. 手动计算每个 Query 对每个 Key 的匹配分数。
+            # [B,Hq,T,D] @ [B,Hq,D,S] -> [B,Hq,T,S]。
+            # 除以 sqrt(D)，缓和维度增大导致的点积尺度增大；后续 softmax 用 float32。
+            scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
+
+            # 8. 构造因果规则：当前第 i 个 Query 的绝对位置是 P+i，
+            # 因而只允许关注 Key j <= P+i，禁止查看未来位置。
+            # 例如 P=3、T=2、S=5，允许矩阵为：
+            # [[1,1,1,1,0], [1,1,1,1,1]]。
+            # tril(diagonal=P) 保留下三角及偏移后的对角线；True 表示允许关注。
+            causal_mask = torch.ones(
+                (seq_len, kv_len), dtype=torch.bool, device=xq.device
+            ).tril(diagonal=past_len)
+            attn_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,S]
+
+            # 9. 有 PAD 时，再与 padding 规则取交集：既不是未来，也不是 PAD，才能看。
+            if attention_mask is not None:
+                padding_mask = (
+                    attention_mask
+                    # [B,S] -> [B,1,1,S]：插入头维度和 Query 维度。
+                    .view(bsz, 1, 1, -1)
+                    # -> [B,Hq,T,S]：每个头、每个 Query 共用这条 Key 有效性规则。
+                    # 最后的 -1 保持 S 不变；expand 本身通过视图共享数据。
+                    .expand(bsz, self.n_local_heads, seq_len, -1)
+                    # 1 -> True（有效），0 -> False（PAD）。
+                    .bool()
                 )
-                output = F.scaled_dot_product_attention(xq,xk,xv,attn_mask = attn_mask,dropout_p=self.dropout 
-                if self.training else 0.0,is_causal=True)
-            else:
-                scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
-                scores = scores + torch.triu(
-                    torch.full((seq_len,seq_len),float("-inf"),device=scores.device),diagonal=1
-                ).unsqueeze(0).unsqueeze(0)
-                if attention_mask is not None:
-                    extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                    scores = scores + extended_attention_mask
-                
-                scores = F.softmax(scores.float(),dim=-1).type_as(xq)
-                scores = self.attn_dropout(scores)
-                output = scores @ xv
-                output = output.transpose(1,2).contiguous().view(bsz,seq_len,-1)
-                output = self.o_proj(output)
-                output = self.resid_dropout(output)
-                return output,past_kv
+                attn_mask = attn_mask & padding_mask
+
+            # 10. 屏蔽位置的分数设为 -inf，使其 softmax 权重为 0。
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+
+            # 左侧补齐可能让某些 PAD Query 没有任何可见 Key。
+            # 先将这种整行设为 0，避免对全 -inf 做 softmax；再将被屏蔽权重清零。
+            # 因此无可见 Key 的 Query 得到零注意力输出，正常 Query 的分数不变。
+            has_valid_key = attn_mask.any(dim=-1, keepdim=True)
+            scores = scores.masked_fill(~has_valid_key, 0.0)
+            attn_weights = F.softmax(scores, dim=-1).masked_fill(~attn_mask, 0.0)
+            attn_weights = attn_weights.type_as(xq)
+            attn_weights = self.attn_dropout(attn_weights)
+
+            # 11. 按注意力权重汇总 V：[B,Hq,T,S] @ [B,Hq,S,D] -> [B,Hq,T,D]。
+            output = attn_weights @ xv
+
+        # 12. 两个计算分支都要做输出投影并返回，不能只放在 else 内部。
+        # 先恢复 [B,T,Hq,D]，再把各头拼成 [B,T,Hq*D]=[B,T,C]。
+        # transpose 改变步长，contiguous 确保内存布局适合后面的 view。
+        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        output = self.o_proj(output)  # 用 W_o 学习混合不同头的信息。
+        output = self.resid_dropout(output)
+
+        # 残差相加通常由外面的 Transformer block 完成；这里返回注意力分支的输出。
+        return output, past_kv
+
+
+class FeedForward(nn.Module):
+    """对每个 token 的隐藏向量做门控非线性变换，所有位置共享同一组参数。
+
+    输入与输出均为 [B,T,C]；中间维度记为 I。
+    默认 hidden_act="silu" 时是 SwiGLU：
+        gate = SiLU(x @ W_gate.T)，其中 SiLU(z) = z * sigmoid(z)
+        up = x @ W_up.T
+        output = Dropout((gate * up) @ W_down.T)
+    * 表示逐元素相乘，门控分支对内容分支的各个特征分别进行调制。
+    """
+
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        # 1. 确定中间维度 I；配置中已指定时，直接使用指定值。
+        intermediate_size = args.intermediate_size
+        if intermediate_size is None:
+            # 普通 C->4C->C 的两层 FFN 约有 8*C^2 个权重。
+            # SwiGLU 有 gate、up、down 三个矩阵，约有 3*C*I 个权重。
+            # 令两者参数规模接近：3*C*I ≈ 8*C^2，得到 I ≈ 8*C/3。
+            intermediate_size = int(args.hidden_size * 8 / 3)
+
+            # 将 I 向上取整到 64 的倍数：ceil(I/64)*64。
+            # 对整数而言 ceil(I/64) = (I+63)//64；对齐有利于矩阵计算的布局。
+            # 默认 C=512：先得到 1365，再向上对齐成 1408。
+            intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            args.intermediate_size = intermediate_size
+
+        # 2. up、gate 分别把 C 维投影到 I 维，使用两组独立的权重。
+        # 默认：[B,T,512] -> [B,T,1408]。
+        self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+
+        # down 将逐元素相乘后的特征映射回 C 维，方便与输入做残差相加。
+        # 默认：[B,T,1408] -> [B,T,512]。
+        self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+
+        # ACT2FN 将字符串名称映射为激活函数，例如 "silu" 对应 SiLU。
+        # 选择其他激活时，仍是门控 FFN，但不再称为 SwiGLU。
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 3. 内容分支 up 和门控分支 gate 都读取原输入 x，形状均为 [B,T,I]。
+        # 激活函数先作用于 gate 分支，再与 up 相乘。
+        # SiLU 输出可为负数或大于 1，因此这里的门控值不是概率。
+        up = self.up_proj(x)
+        gate = self.act_fn(self.gate_proj(x))
+        hidden = gate * up
+
+        # 4. 将门控后的特征投影回隐藏维度；本层不改变 batch 或序列长度。
+        output = self.down_proj(hidden)
+        return self.dropout(output)
+
+
+class MokioMindBlock(nn.Module):
+    """一个使用 Pre-Norm 的 Transformer block：注意力子层 + 门控 FFN 子层。
+
+    两个子层都先归一化输入，再计算变换，最后加回该子层的原始输入：
+        h = x + Attention(RMSNorm_1(x))
+        y = h + FeedForward(RMSNorm_2(h))
+    这里 Attention(...) 表示注意力输出张量，KV 缓存另外传回。
+    x、h、y 的形状均为 [B,T,C]，因此多个 block 可以顺序堆叠。
+    """
+
+    def __init__(self, layer_id: int, config: MokioMindConfig):
+        super().__init__()
+
+        # 保存层编号和维度信息；layer_id 用于标识第几层，本实现不参与数值计算。
+        self.layer_id = layer_id
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+
+        # 注意力负责汇总不同 token 的信息，输入输出均为 [B,T,C]。
+        self.self_attn = Attention(config)
+
+        # 两个独立的 RMSNorm 都沿最后一维 C 归一化，每个模块有自己的缩放权重。
+        # input_layernorm 用在 Attention 之前；post_attention_layernorm 用在 FFN 之前。
+        # 后者的名字表示其处在注意力子层之后，而这个 block 整体仍采用 Pre-Norm。
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # FFN 对每个 token 的特征向量进行门控变换，本模块使用稠密 FeedForward。
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """返回本层更新后的 [B,T,C] 隐藏状态，以及本层可选的 KV 缓存。
+
+        position_embeddings 是当前 token 对应的 cos、sin；缓存和掩码的格式
+        与 Attention.forward 相同。不同 block 应分别保存、传入各自的 KV 缓存。
+        """
+        # 1. 第一条残差路径：保存注意力子层的原始输入 x。
+        # 只把归一化后的输入送给 Attention，旁路保留原始信息及其梯度路径。
+        residual = hidden_states
+        normed_states = self.input_layernorm(hidden_states)
+        attn_output, present_key_value = self.self_attn(
+            normed_states,
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+        )
+
+        # 2. h = x + Attention(RMSNorm_1(x))；两项形状相同，可逐元素相加。
+        hidden_states = residual + attn_output
+
+        # 3. 第二条残差路径：以注意力子层的输出 h 作为 FFN 子层的原始输入。
+        residual = hidden_states
+        normed_states = self.post_attention_layernorm(hidden_states)
+        ffn_output = self.mlp(normed_states)
+
+        # 4. y = h + FeedForward(RMSNorm_2(h))，输出仍为 [B,T,C]。
+        hidden_states = residual + ffn_output
+
+        # 本层 KV 来自 Attention；FFN 逐 token 计算，不新增历史 KV 缓存。
+        return hidden_states, present_key_value
