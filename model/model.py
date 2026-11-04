@@ -4,9 +4,16 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PretrainedConfig
+from transformers.cache_utils import DynamicCache
+from transformers.configuration_utils import PretrainedConfig
+from transformers.generation.utils import GenerationMixin
 from transformers.activations import ACT2FN
+from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
+# 每层是 (K, V) 两个张量；外层列表按 Transformer 层的顺序保存缓存。
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+PastKeyValues = list[Optional[KVCache]]
 
 
 class MiniMindBConfig(PretrainedConfig):
@@ -337,7 +344,7 @@ class Attention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
-    ) :
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         """计算因果自注意力，返回当前 token 的输出和可选的 KV 缓存。
 
         维度记号：
@@ -431,7 +438,7 @@ class Attention(nn.Module):
             # [[1,1,1,1,0], [1,1,1,1,1]]。
             # tril(diagonal=P) 保留下三角及偏移后的对角线；True 表示允许关注。
             causal_mask = torch.ones(
-                (seq_len, kv_len), dtype=torch.bool, device=xq.device
+                seq_len, kv_len, dtype=torch.bool, device=xq.device
             ).tril(diagonal=past_len)
             attn_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,S]
 
@@ -599,3 +606,149 @@ class MiniMindBBlock(nn.Module):
 
         # 本层 KV 来自 Attention；FFN 逐 token 计算，不新增历史 KV 缓存。
         return hidden_states, present_key_value
+
+class MiniMindBModel(nn.Module):
+    # register_buffer 动态注册属性；声明类型后，编辑器可确定它们支持张量切片。
+    freqs_cos: torch.Tensor
+    freqs_sin: torch.Tensor
+
+    def __init__(self, config: MiniMindBConfig):
+        super().__init__()
+        self.vocab_size,self.num_hidden_layers=(
+            config.vocab_size,config.num_hidden_layers
+        )
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBBlock(i, config) for i in range(config.num_hidden_layers)])
+        self.layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos,freqs_sin =precompute_freqs(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling,
+        )
+
+        self.register_buffer("freqs_cos",freqs_cos,persistent=False)
+        self.register_buffer("freqs_sin",freqs_sin,persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[PastKeyValues] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, PastKeyValues]:
+        if input_ids is None:
+            raise ValueError("必须传入 input_ids")
+        batch_size, seq_len = input_ids.shape
+        if not past_key_values:
+            # 显式指定元素类型，避免空缓存被推断成只能存放 None 的列表。
+            past_key_values = list[Optional[KVCache]](
+                None for _ in self.layers
+            )
+        if len(past_key_values) != len(self.layers):
+            raise ValueError("past_key_values 必须为每个 Transformer 层提供一项缓存")
+
+        # 每层缓存为 (K, V) 或 None；K 的布局是 [B, 历史长度, Hkv, D]。
+        # 先取到局部变量再判空，类型检查器便能确定非空分支中的 K 是张量。
+        first_cache = past_key_values[0] if past_key_values else None
+        start_pos = first_cache[0].shape[1] if first_cache is not None else 0
+        if start_pos + seq_len > self.freqs_cos.shape[0]:
+            raise ValueError("输入与历史缓存的总长度超过了 RoPE 位置表长度")
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
+
+        presents: PastKeyValues = []
+
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states,present = layer(
+                hidden_states,position_embeddings,
+                past_key_value = past_key_value,use_cache = use_cache,attention_mask = attention_mask,
+            )
+
+            presents.append(present)
+
+        hidden_states = self.layer_norm(hidden_states)
+        return hidden_states,presents
+
+class MiniMindBForCausalLM(PreTrainedModel, GenerationMixin):
+    # PreTrainedModel 提供模型基类功能，GenerationMixin 提供 generate() 接口。
+    # config_class 指明这个模型使用哪种配置类。
+    config_class = MiniMindBConfig
+
+    def __init__(self,config:MiniMindBConfig):
+        # 父类初始化会保存 config，并准备 Hugging Face 模型需要的基础属性。
+        super().__init__(config)
+        # model 是 Transformer 主干，输出每个 token 的 C 维隐藏向量。
+        self.model = MiniMindBModel(config)
+        # 输出层把 C 维特征映射成 V 个词表分数：h @ W.T；False 表示不使用偏置。
+        self.lm_head = nn.Linear(config.hidden_size,config.vocab_size, False)
+        # 输入嵌入与输出投影共享同一个 [V,C] 权重参数。
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: PastKeyValues | DynamicCache | None = None,
+        use_cache: bool = False,
+        logits_to_keep: int | torch.Tensor = 0,
+        **args,
+    ):
+        # 维度约定：B=批次大小，T=本次输入长度，P=历史缓存长度，
+        # C=hidden_size，V=vocab_size，H=KV 头数，D=每个注意力头的维度。
+        # input_ids：[B,T]；attention_mask 通常为 [B,P+T]，1 表示有效 Key。
+
+        # 1. 将接口传入的缓存转换为主干认识的格式。
+        # generate() 的缓存布局是 [B,H,P,D]，本模型内部使用 [B,P,H,D]。
+        # transpose(1,2) 交换“头数”和“历史长度”两个轴，不改变张量中的数值。
+        # 首次生成时，某层可能是 (None,None)，对应主干中的 None。
+        # 如果调用者传来的已经是本项目的列表缓存，就直接沿用。
+        if isinstance(past_key_values, DynamicCache):
+            past_key_values = [
+                None if key is None and value is None
+                else (key.transpose(1, 2), value.transpose(1, 2))
+                for key, value in past_key_values.to_legacy_cache()
+            ]
+
+        # 2. 主干依次完成 Embedding、各层 Attention/FFN 和最终 RMSNorm。
+        # hidden_states：[B,T,C]，表示本次输入的所有 token 的最终特征。
+        # 返回的 past_key_values 是新的逐层缓存列表，覆盖这里同名的输入变量；
+        # use_cache=True 时，每层保存两个 [B,P+T,H,D] 张量，否则每项为 None。
+        # **args 将额外的关键字参数继续传给主干。
+        hidden_states,past_key_values = self.model(
+            input_ids = input_ids,attention_mask = attention_mask,
+            past_key_values = past_key_values,use_cache = use_cache,**args
+        )
+
+        # 3. 决定返回哪些 token 位置的词表分数。
+        # 整数 n>0 表示保留末尾 n 个位置；0 表示保留全部位置。
+        # 负数不是有效的“保留数量”，因此抛出明确的异常。
+        if isinstance(logits_to_keep, int) and logits_to_keep < 0:
+            raise ValueError("logits_to_keep 不能为负数")
+        # slice(-n,None) 相当于 [-n:]；n=0 时 -0=0，即 [0:]，保留整段。
+        # 若传入整数索引张量，例如 tensor([0,2])，则选择第 0、2 个位置。
+        slice_indices = (
+            slice(-logits_to_keep,None)
+            if isinstance(logits_to_keep,int) else logits_to_keep
+        )
+        # 4. 先将完整隐藏状态投影为 logits：[B,T,C] -> [B,T,V]。
+        # 再沿第 1 维选取位置，得到 [B,N,V]；N 是实际保留的位置数。
+        # 当前顺序只减少返回的位置数，lm_head 仍计算全部 T 个位置。
+        # logits 是未经过 softmax 的原始分数，不能直接当作概率。
+        logits = self.lm_head(hidden_states)[:,slice_indices,:]
+
+        return CausalLMOutputWithPast(
+            logits = logits,past_key_values = past_key_values,
+            hidden_states = hidden_states,
+        )
