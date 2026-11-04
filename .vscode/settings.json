@@ -30,5 +30,20 @@
         "VIRTUAL_ENV": null,
         "CONDA_PREFIX": "D:\\anaconda",
         "CONDA_DEFAULT_ENV": "base"
-    }
+    },
+    "files.watcherExclude": {
+        "**/.pytest_cache/**": true,
+        "**/.mypy_cache/**": true,
+        "**/__pycache__/**": true,
+        "**/venv/**": true,
+        "**/.venv/**": true
+    },
+    "search.exclude": {
+        "**/__pycache__/**": true,
+        "**/venv/**": true,
+        "**/.venv/**": true
+    },
+    "editor.smoothScrolling": false,
+    "workbench.list.smoothScrolling": false,
+    "editor.cursorSmoothCaretAnimation": "off"
 }
