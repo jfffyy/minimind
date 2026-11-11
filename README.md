@@ -1,4 +1,4 @@
-# MiniMind 学习项目
+# MiniMindB 学习项目
 
 当前按 MiniMind 视频学习并补齐自己的模型实现；源码入口为 `model/model.py`。学习进度按实际代码与输出记录推进。
 
