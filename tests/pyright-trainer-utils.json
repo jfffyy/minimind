@@ -1,0 +1,8 @@
+{
+    "typeCheckingMode": "basic",
+    "pythonVersion": "3.13",
+    "pythonPlatform": "Windows",
+    "include": ["../trainer/trainer_utils.py"],
+    "extraPaths": [".."],
+    "useLibraryCodeForTypes": true
+}

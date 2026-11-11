@@ -1,0 +1,11 @@
+iteration	errors_before	errors_after	fix_applied	status
+1	1	1	Corrected model import; exposed device-transfer typing error	no_change
+2	1	0	Called the same Transformers device-transfer method with explicit self	done
+3	2	2	Aligned pretrain batches and loss; fixed optional tracking and DDP; exposed AMP export annotations	no_change
+4	2	0	Imported AMP implementations explicitly; verified pretrain loop and checkpoint regressions	done
+5	4	2	Used get_parameter for the unchanged query-projection gradient assertion	improved
+6	2	0	Validated the bound generation interface and tensor outputs; retained cache-parity assertions	done
+7	20	13	Separated internal and external cache types and narrowed nullable KV tensors	improved
+8	13	0	Wrapped test samples in Dataset and checked optional checkpoints before indexing	done
+9	2	0	Migrated RoPE configuration with identical frequency values and fixed weight-loading directories	done
+10	1	0	Reduced tokenizer import analysis overhead and restarted the language server after recorded OOM	done

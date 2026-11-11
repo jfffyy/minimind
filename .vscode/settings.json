@@ -6,7 +6,7 @@
     "basedpyright.analysis.autoImportCompletions": true,
     "basedpyright.analysis.autoSearchPaths": true,
     "basedpyright.analysis.useLibraryCodeForTypes": true,
-    "basedpyright.analysis.diagnosticMode": "openFilesOnly",
+    "basedpyright.analysis.diagnosticMode": "workspace",
     "codingcopilot.enableAutoCompletions": true,
     "codingcopilot.enableCompletionLanguage": {
         "python": true

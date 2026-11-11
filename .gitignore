@@ -158,3 +158,9 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Local training data and generated run artifacts
+/dataset/pretrain_t2t_mini.jsonl
+/dataset/pretrain_t2t_mini.jsonl.part
+/checkpoints/
+/runs/

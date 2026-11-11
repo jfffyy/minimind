@@ -1,0 +1,4 @@
+{
+    "extends": "pyright-trainer-utils.json",
+    "include": ["../trainer/trainer_pretrain.py"]
+}

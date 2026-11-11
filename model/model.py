@@ -73,15 +73,16 @@ class MiniMindBConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha
         self.scoring_func = scoring_func
 
-        # 未启用长文本外推时为 None；读取字段处需先判空，避免 None.get(...)
-        self.rope_scaling: dict[str, str | float | int] | None = (
+        # Transformers 5.x 使用 rope_parameters；RoPE 数值参数保持不变。
+        self.rope_parameters: dict[str, str | float | int] | None = (
             {
                 "beta_fast": 32,
                 "beta_slow": 1,
                 "factor": 16,
                 "original_max_position_embeddings": 2048,
                 "attention_factor": 1.0,
-                "type": "yarn",
+                "rope_type": "yarn",
+                "rope_theta": self.rope_theta,
             }
             if self.inference_rope_scaling
             else None
@@ -627,7 +628,7 @@ class MiniMindBModel(nn.Module):
             dim = config.hidden_size // config.num_attention_heads,
             end = config.max_position_embeddings,
             rope_base = config.rope_theta,
-            rope_scaling = config.rope_scaling,
+            rope_scaling = config.rope_parameters,
         )
 
         self.register_buffer("freqs_cos",freqs_cos,persistent=False)
@@ -716,17 +717,19 @@ class MiniMindBForCausalLM(PreTrainedModel, GenerationMixin):
         # 如果调用者传来的已经是本项目的列表缓存，就直接沿用。
         if isinstance(past_key_values, DynamicCache):
             past_key_values = [
-                None if key is None and value is None
+                None if key is None or value is None
                 else (key.transpose(1, 2), value.transpose(1, 2))
-                for key, value in past_key_values.to_legacy_cache()
+                # Transformers 5.x 迭代得到 (K, V, 滑动窗口信息)；本模型只使用 K、V。
+                for key, value, _ in past_key_values
             ]
 
         # 2. 主干依次完成 Embedding、各层 Attention/FFN 和最终 RMSNorm。
         # hidden_states：[B,T,C]，表示本次输入的所有 token 的最终特征。
-        # 返回的 past_key_values 是新的逐层缓存列表，覆盖这里同名的输入变量；
+        # 返回的 presents 是新的逐层缓存列表，与接口传入的缓存类型分开；
         # use_cache=True 时，每层保存两个 [B,P+T,H,D] 张量，否则每项为 None。
         # **args 将额外的关键字参数继续传给主干。
-        hidden_states,past_key_values = self.model(
+        presents: PastKeyValues
+        hidden_states,presents = self.model(
             input_ids = input_ids,attention_mask = attention_mask,
             past_key_values = past_key_values,use_cache = use_cache,**args
         )
@@ -748,7 +751,19 @@ class MiniMindBForCausalLM(PreTrainedModel, GenerationMixin):
         # logits 是未经过 softmax 的原始分数，不能直接当作概率。
         logits = self.lm_head(hidden_states)[:,slice_indices,:]
 
+        # 接口返回 DynamicCache，而不是内部列表；未启用缓存时返回 None。
+        # 内部 K/V 为 [B,P,H,D]，Transformers 的缓存为 [B,H,P,D]。
+        output_cache: DynamicCache | None = None
+        if use_cache:
+            output_cache = DynamicCache()
+            for layer_idx, kv in enumerate(presents):
+                if kv is not None:
+                    key, value = kv
+                    output_cache.update(
+                        key.transpose(1, 2), value.transpose(1, 2), layer_idx
+                    )
+
         return CausalLMOutputWithPast(
-            logits = logits,past_key_values = past_key_values,
-            hidden_states = hidden_states,
+            logits = logits,past_key_values = output_cache,
+            hidden_states = (hidden_states,),
         )
