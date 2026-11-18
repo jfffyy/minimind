@@ -162,5 +162,7 @@ vite.config.ts.timestamp-*
 # Local training data and generated run artifacts
 /dataset/pretrain_t2t_mini.jsonl
 /dataset/pretrain_t2t_mini.jsonl.part
+/dataset/sft_t2t_mini.jsonl
+/dataset/sft_t2t_mini.jsonl.part
 /checkpoints/
 /runs/
